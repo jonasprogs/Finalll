@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lebensmittel · PWA (leicht)</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0f172a">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<style>
+  :root{--bg:#0f172a;--panel:#111827;--muted:#94a3b8;--text:#e5e7eb;--green:#22c55e;--red:#ef4444;}
+  *{box-sizing:border-box} body{margin:0;background:linear-gradient(180deg,#0b1220,var(--bg));color:var(--text);
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; padding:16px}
+  .wrap{max-width:720px;margin:0 auto}
+  h1{font-size:22px;margin:4px 0 12px}
+  .row{display:flex;gap:10px;flex-wrap:wrap}.row>*{flex:1}
+  .card{background:rgba(17,24,39,.95);border:1px solid #1f2937;border-radius:14px;padding:14px;margin:10px 0}
+  label{display:block;margin:6px 0 4px;color:var(--muted)}
+  input,button{width:100%;padding:12px;border-radius:12px;border:1px solid #1f2937;background:#0b1220;color:var(--text)}
+  button{cursor:pointer}
+  table{width:100%;border-collapse:collapse;margin-top:8px}
+  th,td{border-top:1px solid #1f2937;padding:8px;text-align:left}
+  .right{text-align:right} .ok{color:var(--green)} .bad{color:var(--red)} .muted{color:var(--muted)}
+  .pill{padding:8px 12px;border-radius:999px;background:#1f2937;border-color:#1f2937;flex:0 0 auto}
+  #err{display:none;position:fixed;left:0;right:0;bottom:0;background:#7f1d1d;color:#fee2e2;padding:10px;border-top:2px solid #991b1b;z-index:9999}
+  header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Lebensmittel · PWA (leicht)</h1>
+    <div class="row" style="gap:8px;flex-wrap:nowrap">
+      <button id="install" class="pill">Installieren</button>
+      <button id="clearCache" class="pill">Cache leeren</button>
+    </div>
+  </header>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>Monatsbudget (€)</label>
+        <input id="budget" inputmode="decimal" placeholder="z. B. 300,00">
+      </div>
+      <div>
+        <label>Bisher ausgegeben (Override, €)</label>
+        <input id="spentOverride" inputmode="decimal" placeholder="leer lassen = automatisch">
+      </div>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="saveSettings" class="pill">Speichern</button>
+      <button id="clearOverride" class="pill">Override zurücksetzen</button>
+    </div>
+    <p class="muted">„Heute verfügbar“ = (Budget/Monatstage × Heutiger Tag) − (Override oder Summe der Ausgaben des Monats)</p>
+    <div id="summary" class="muted">–</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <input id="expName" placeholder="Name (z. B. Lidl)">
+      <input id="expAmount" placeholder="Betrag (z. B. 12,50)" inputmode="decimal">
+      <input id="expDate" type="date">
+      <button id="addExp" class="pill">+ Hinzufügen</button>
+    </div>
+    <table id="table">
+      <thead><tr><th>Datum</th><th>Name</th><th class="right">Betrag</th><th>Aktionen</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div id="err"></div>
+
+<script>
+  // PWA install prompt & SW registration
+  let deferredPrompt=null;
+  if('serviceWorker' in navigator){
+    window.addEventListener('load', ()=> navigator.serviceWorker.register('sw.js'));
+  }
+  window.addEventListener('beforeinstallprompt', (e)=>{ e.preventDefault(); deferredPrompt=e; });
+  document.getElementById('install').addEventListener('click', async ()=>{
+    if(deferredPrompt){ deferredPrompt.prompt(); await deferredPrompt.userChoice; deferredPrompt=null; }
+    else alert('Wenn die Schaltfläche grau ist, ist bereits installiert oder die Plattform unterstützt kein Install-Prompt.');
+  });
+  document.getElementById('clearCache').addEventListener('click', async ()=>{
+    try{
+      if('serviceWorker' in navigator){
+        const regs = await navigator.serviceWorker.getRegistrations();
+        for(const r of regs) await r.unregister();
+      }
+      if('caches' in window){
+        const keys = await caches.keys();
+        for(const k of keys) await caches.delete(k);
+      }
+      alert('Cache & Service Worker geleert. Seite neu laden.');
+    }catch(e){ alert('Cleanup-Fehler: '+e); }
+  });
+
+  // Fehlerbanner
+  window.addEventListener('error', e=>{ const el=document.getElementById('err'); el.style.display='block'; el.textContent='Fehler: '+(e.message||e.error||''); });
+  window.addEventListener('unhandledrejection', e=>{ const el=document.getElementById('err'); el.style.display='block'; el.textContent='Fehler (Promise): '+(e.reason && (e.reason.message||e.reason)); });
+
+  const $ = (s)=> document.querySelector(s);
+  const LS = 'pwa_lite_v1';
+  const uuid = ()=> (window.crypto && crypto.randomUUID ? crypto.randomUUID() : ('id_'+Math.random().toString(36).slice(2)));
+
+  function toCents(raw){
+    if(raw==null) return null;
+    let t=(''+raw).trim().replace(/\s|€/g,'');
+    t=t.replace(',','.');
+    const v=parseFloat(t);
+    if(Number.isNaN(v)) return null;
+    return Math.round(v*100);
+  }
+  function fromCents(c){ return (c/100).toLocaleString('de-DE',{style:'currency',currency:'EUR'}); }
+  function isoToday(){ const d=new Date(); d.setHours(0,0,0,0); return d.toISOString().slice(0,10); }
+  function daysInMonth(d){ return new Date(d.getFullYear(), d.getMonth()+1, 0).getDate(); }
+  function monthOf(iso){ return iso.slice(0,7); }
+
+  function load(){
+    try{ const raw=localStorage.getItem(LS); return raw? JSON.parse(raw): {budget:null, override:null, expenses:[]}; }
+    catch(e){ return {budget:null, override:null, expenses:[]}; }
+  }
+  function save(st){ localStorage.setItem(LS, JSON.stringify(st)); }
+
+  function calc(st){
+    const curM = isoToday().slice(0,7);
+    const monthExps = st.expenses.filter(e=> monthOf(e.date)===curM);
+    const sum = monthExps.reduce((a,b)=> a+(b.amount||0), 0);
+    const used = (st.override!=null) ? st.override : sum;
+    const now = new Date(); const dim = daysInMonth(now); const dom = now.getDate();
+    const budget = st.budget || 0;
+    const allow = (budget/dim)*dom - used;
+    return {allow, used, budget, dim, dom, monthExps};
+  }
+
+  function render(){
+    const st = load();
+    $('#budget').value = st.budget!=null ? (st.budget/100).toString().replace('.',',') : '';
+    $('#spentOverride').value = st.override!=null ? (st.override/100).toString().replace('.',',') : '';
+    if(!$('#expDate').value) $('#expDate').value = isoToday();
+
+    const r = calc(st);
+    const cls = r.allow>=0 ? 'ok' : 'bad';
+    document.getElementById('summary').innerHTML =
+      \`Budget: <b>\${fromCents(r.budget)}</b> · Ausgegeben (Monat): <b>\${fromCents(r.used)}</b><br>Heute verfügbar: <b class="\${cls}">\${fromCents(r.allow)}</b> (Tag \${r.dom}/\${r.dim})\`;
+
+    const tb = document.querySelector('#table tbody'); tb.innerHTML='';
+    for(const e of r.monthExps.sort((a,b)=> b.date.localeCompare(a.date))){
+      const tr = document.createElement('tr');
+      tr.innerHTML = \`<td>\${e.date}</td><td>\${e.name}</td><td class="right">\${fromCents(e.amount)}</td>
+                      <td><button class="pill" data-id="\${e.id}">Löschen</button></td>\`;
+      tb.appendChild(tr);
+    }
+    tb.querySelectorAll('button').forEach(btn=> btn.addEventListener('click', ()=>{
+      const id = btn.getAttribute('data-id');
+      const st2 = load(); st2.expenses = st2.expenses.filter(x=>x.id!==id); save(st2); render();
+    }));
+  }
+
+  document.getElementById('saveSettings').addEventListener('click', ()=>{
+    const st = load();
+    const b = toCents(document.getElementById('budget').value);
+    const oRaw = document.getElementById('spentOverride').value.trim();
+    const o = oRaw==='' ? null : toCents(oRaw);
+    if(b==null){ alert('Bitte Budget eingeben.'); return; }
+    if(oRaw!=='' && o==null){ alert('Bitte gültigen „Bisher ausgegeben“-Betrag eingeben.'); return; }
+    st.budget = b; st.override = o; save(st); render();
+  });
+  document.getElementById('clearOverride').addEventListener('click', ()=>{
+    const st = load(); st.override = null; save(st); render();
+  });
+  document.getElementById('addExp').addEventListener('click', ()=>{
+    const name = (document.getElementById('expName').value||'').trim() || '(ohne Titel)';
+    const amount = toCents(document.getElementById('expAmount').value);
+    const date = document.getElementById('expDate').value || isoToday();
+    if(amount==null){ alert('Bitte gültigen Betrag eingeben.'); return; }
+    const st = load();
+    st.expenses.push({id: uuid(), name, amount, date});
+    save(st);
+    document.getElementById('expName').value='';
+    document.getElementById('expAmount').value='';
+    render();
+  });
+
+  // Initial render
+  render();
+</script>
+</body>
+</html>
